@@ -336,47 +336,346 @@ boot::semver_cmp() {
   printf '%s\n' "0"
 }
 
-# --- Arrays (functional, nameref-safe) ----------------------------------------
+# --- Internals: tiny guards ---------------------------------------------------
 
-##** Map an array via function callback (value, index) -> echo result. */
-boot::map(){
-  local -n __in="${1:?}" __out="${2:?}"; local cb="${3:?}"
-  __out=(); local i
-  for i in "${!__in[@]}"; do __out+=("$("$cb" "${__in[$i]}" "$i")"); done
+##**
+# Ensure that a given name refers to a callable entity.
+# -----------------------------------------------------------------------------
+# Accepts user-defined functions, builtins, keywords, or external executables
+# available in PATH. Used internally to validate callbacks and predicates.
+#
+# @param string $1  Name to check.
+# @return 0         If callable.
+# @return 127       If not callable (prints an error to stderr).
+#
+# @example
+#   boot::__require_callable my_func || exit 1
+##**
+boot::__require_callable() {
+  local name="${1:?missing name}"
+  if [[ "$(type -t -- "$name" 2>/dev/null)" =~ ^(function|file|builtin|keyword)$ ]]; then
+    return 0
+  fi
+  printf 'boot: error: callback "%s" not found or not callable\n' "$name" >&2
+  return 127
 }
 
-##** Filter an array via predicate function (value, index) -> exit 0 keep. */
-boot::filter(){
-  local -n __in="${1:?}" __out="${2:?}"; local pd="${3:?}"
-  __out=(); local i v
-  for i in "${!__in[@]}"; do v="${__in[$i]}"; if "$pd" "$v" "$i"; then __out+=("$v"); fi; done
+##**
+# Ensure that a variable is a declared indexed array (declare -a).
+# -----------------------------------------------------------------------------
+# Validates a nameref target before mapping or filtering. Fails if undeclared
+# or not an indexed array.
+#
+# @param string $1  Variable name to validate.
+# @return 0         If valid indexed array.
+# @return 2         If undeclared or not an indexed array (prints error).
+#
+# @example
+#   local -a xs=(a b c)
+#   boot::__require_array_var xs || exit 2
+##**
+boot::__require_array_var() {
+  local var="${1:?missing var}"
+  local decl
+  if ! decl=$(declare -p -- "$var" 2>/dev/null); then
+    printf 'boot: error: "%s" is not declared (expect indexed array)\n' "$var" >&2
+    return 2
+  fi
+  if [[ ! "$decl" =~ ^declare\ -a\  ]]; then
+    printf 'boot: error: "%s" is not an indexed array (declare -a ...)\n' "$var" >&2
+    return 2
+  fi
+  return 0
 }
 
-##** Reduce an array via reducer function (acc, value) -> echo new_acc. */
-boot::reduce(){
-  local -n __in="${1:?}"; local acc="${2:?}"; local -n __out="${3:?}"; local rd="${4:?}"; local v
-  for v in "${__in[@]}"; do acc="$("$rd" "$acc" "$v")"; done
+##**
+# Validate that a string is a valid shell identifier.
+# -----------------------------------------------------------------------------
+# Matches ^[a-zA-Z_][a-zA-Z0-9_]*$. Used to validate variable names for namerefs.
+#
+# @param string $1  Candidate identifier.
+# @return 0         If valid identifier.
+# @return 2         If invalid (prints error).
+#
+# @example
+#   boot::__require_ident OUT_VAR || exit 2
+##**
+boot::__require_ident() {
+  local v="${1:?}"
+  [[ "$v" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] && return 0
+  printf 'boot: error: invalid identifier "%s"\n' "$v" >&2
+  return 2
+}
+
+# --- Arrays (functional, nameref-safe) ---------------------------------------
+
+##**
+# Map an array through a callback function (value, index) -> echo result.
+# -----------------------------------------------------------------------------
+# Invokes the callback for each element of IN array and writes each result to
+# OUT array. The callback must echo exactly one line per input. On callback
+# failure (non-zero exit), the element is skipped with a warning.
+#
+# Usage:
+#   boot::map IN_ARR OUT_ARR cb_func
+#
+# @param string $1  Name of input array (declare -a).
+# @param string $2  Name of output array (declare -a).
+# @param string $3  Callback function or command.
+# @return 0         On success (skipped elements allowed).
+# @return 2|127     On validation error.
+#
+# @example
+#   to_upper(){ printf '%s' "${1^^}"; }
+#   local -a xs=(a b c) ys=()
+#   boot::map xs ys to_upper
+#   # ys -> (A B C)
+##**
+boot::map() {
+  local in_name="${1:?missing IN array}" out_name="${2:?missing OUT array}" cb="${3:?missing callback}"
+  boot::__require_ident "$in_name"  && boot::__require_array_var "$in_name"  || return $?
+  boot::__require_ident "$out_name" && boot::__require_callable "$cb"        || return $?
+
+  local -n __in="$in_name" __out="$out_name"
+  __out=()
+
+  local i out
+  for i in "${!__in[@]}"; do
+    if ! out="$("$cb" "${__in[$i]}" "$i")"; then
+      printf 'boot::map: warning: callback "%s" failed at index %s; skipping element\n' "$cb" "$i" >&2
+      continue
+    fi
+    __out+=("$out")
+  done
+}
+
+##**
+# Filter an array using a predicate function (value, index) -> exit 0 to keep.
+# -----------------------------------------------------------------------------
+# Copies only elements for which the predicate returns success (0) into the
+# OUT array. Non-zero exit codes exclude the element.
+#
+# Usage:
+#   boot::filter IN_ARR OUT_ARR pred_func
+#
+# @param string $1  Name of input array (declare -a).
+# @param string $2  Name of output array (declare -a).
+# @param string $3  Predicate function or command.
+# @return 0         On success.
+# @return 2|127     On validation error.
+#
+# @example
+#   is_even_len(){ (( ${#1} % 2 == 0 )); }
+#   local -a xs=(a bb ccc dddd) ys=()
+#   boot::filter xs ys is_even_len
+#   # ys -> (bb dddd)
+##**
+boot::filter() {
+  local in_name="${1:?missing IN array}" out_name="${2:?missing OUT array}" pd="${3:?missing predicate}"
+  boot::__require_ident "$in_name"  && boot::__require_array_var "$in_name"  || return $?
+  boot::__require_ident "$out_name" && boot::__require_callable "$pd"        || return $?
+
+  local -n __in="$in_name" __out="$out_name"
+  __out=()
+
+  local i v
+  for i in "${!__in[@]}"; do
+    v="${__in[$i]}"
+    if "$pd" "$v" "$i"; then
+      __out+=("$v")
+    fi
+  done
+}
+
+##**
+# Reduce an array using a reducer: (acc, value) -> echo new_acc.
+# -----------------------------------------------------------------------------
+# Iterates through each element of the IN array, calling reducer(acc, value)
+# and updating the accumulator. If reducer fails (non-zero exit), the previous
+# accumulator is kept and a warning is printed.
+#
+# Usage:
+#   boot::reduce IN_ARR INIT_ACC OUT_SCALAR reducer_func
+#
+# @param string $1  Input array name (declare -a).
+# @param string $2  Initial accumulator value.
+# @param string $3  Output scalar variable name.
+# @param string $4  Reducer function or command.
+# @return 0         On success.
+# @return 2|127     On validation error.
+#
+# @example
+#   add(){ printf '%s' "$(( ${1:-0} + ${2:-0} ))"; }
+#   local -a xs=(1 2 3); local sum=""
+#   boot::reduce xs 0 sum add
+#   # sum -> "6"
+##**
+boot::reduce() {
+  local in_name="${1:?missing IN array}" acc="${2:?missing init acc}" out_name="${3:?missing OUT var}" rd="${4:?missing reducer}"
+  boot::__require_ident "$in_name"  && boot::__require_array_var "$in_name" || return $?
+  boot::__require_ident "$out_name" && boot::__require_callable "$rd"       || return $?
+
+  local -n __in="$in_name" __out="$out_name"
+  local v next
+  for v in "${__in[@]}"; do
+    if ! next="$("$rd" "$acc" "$v")"; then
+      printf 'boot::reduce: warning: reducer "%s" failed; keeping previous acc\n' "$rd" >&2
+      continue
+    fi
+    acc="$next"
+  done
   __out="$acc"
 }
 
-##** Parallel map (order-preserving); function callback receives (value, index). */
-boot::par_map(){
-  local conc="${1:?}"; shift
-  local -n __in="${1:?}" __out="${2:?}"; local cb="${3:?}"
-  (( conc<1 )) && conc=1; __out=()
-  local -a TF=() P=(); local i tf pid
+##**
+# Perform parallel map over an array (order-preserving).
+# -----------------------------------------------------------------------------
+# Executes callback(value, index) for each element concurrently, up to the
+# specified concurrency level. Output order matches input order. Each callback’s
+# stdout is captured as its result.
+#
+# If any job fails, the function exits with code 1 unless BOOT_PAR_MAP_SOFT=1
+# is set (then only warnings are printed).
+#
+# Usage:
+#   boot::par_map CONCURRENCY IN_ARR OUT_ARR cb_func
+#
+# Env:
+#   BOOT_PAR_MAP_SOFT=1  Downgrade job failures to warnings.
+#
+# @param int    $1  Concurrency (>=1; 0 treated as 1).
+# @param string $2  Input array name (declare -a).
+# @param string $3  Output array name (declare -a).
+# @param string $4  Callback function or command.
+# @return 0         On success.
+# @return 1         If any job failed (hard mode).
+# @return 2|127     On validation error.
+#
+# @example
+#   work(){ printf '%s-%s' "$1" "$2"; sleep 0.1; }
+#   local -a xs=(A B C D) ys=()
+#   boot::par_map 2 xs ys work
+#   # ys -> (A-0 B-1 C-2 D-3)
+##**
+boot::par_map() {
+  local conc="${1:?missing concurrency}"; shift || true
+  local in_name="${1:?missing IN array}" out_name="${2:?missing OUT array}" cb="${3:?missing callback}"
+
+  if [[ ! "$conc" =~ ^[0-9]+$ ]]; then
+    printf 'boot::par_map: error: concurrency must be a non-negative integer\n' >&2
+    return 2
+  fi
+  (( conc < 1 )) && conc=1
+
+  boot::__require_ident "$in_name"  && boot::__require_array_var "$in_name"  || return $?
+  boot::__require_ident "$out_name" && boot::__require_callable "$cb"        || return $?
+
+  local -n __in="$in_name" __out="$out_name"
+  __out=()
+
+  local tmpd
+  tmpd="$(mktemp -d -t boot_par_map.XXXXXX)" || { printf 'boot::par_map: mktemp failed\n' >&2; return 1; }
+  local cleanup='_code=$?; rm -rf -- '"$tmpd"' 2>/dev/null || true; exit $_code'
+  trap "$cleanup" EXIT INT TERM
+
+  local -a pids=()
+  local i pid running=0
   for i in "${!__in[@]}"; do
-    tf="$(mktemp)"; TF+=("$tf")
-    ( "$cb" "${__in[$i]}" "$i" >"$tf" ) & pid=$!
-    P+=("$pid")
-    while (( ${#P[@]} >= conc )); do wait "${P[0]}" || true; P=("${P[@]:1}"); done
+    {
+      "$cb" "${__in[$i]}" "$i" >"${tmpd}/$i.out"
+    } & pid=$!
+    pids+=("$pid")
+    (( running++ ))
+    while (( running >= conc )); do
+      if builtin help wait >/dev/null 2>&1 && wait -n 2>/dev/null; then
+        (( running-- ))
+      else
+        wait "${pids[0]}" || true
+        pids=("${pids[@]:1}")
+        (( running-- ))
+      fi
+    done
   done
-  for pid in "${P[@]}"; do wait "$pid" || true; done
-  for tf in "${TF[@]}"; do __out+=("$(<"$tf")"); rm -f -- "$tf"; done
+
+  local any_fail=0
+  for pid in "${pids[@]}"; do
+    if ! wait "$pid"; then
+      any_fail=1
+    fi
+  done
+
+  local idx
+  for idx in "${!__in[@]}"; do
+    if [[ -f "${tmpd}/$idx.out" ]]; then
+      __out+=("$(<"${tmpd}/$idx.out")")
+    else
+      __out+=("")
+    fi
+  done
+
+  if (( any_fail )) && [[ "${BOOT_PAR_MAP_SOFT:-0}" != "1" ]]; then
+    printf 'boot::par_map: error: one or more tasks failed\n' >&2
+    return 1
+  elif (( any_fail )); then
+    printf 'boot::par_map: warning: one or more tasks failed (soft mode)\n' >&2
+  fi
 }
 
-##** Stream processors (function names, no eval). */
-boot::pipe_map(){ local cb="${1:?}" line i=0; while IFS= read -r line; do "$cb" "$line" "$i"; ((i++)); done; }
-boot::pipe_filter(){ local pd="${1:?}" line i=0; while IFS= read -r line; do if "$pd" "$line" "$i"; then printf "%s\n" "$line"; fi; ((i++)); done; }
+##**
+# Map over stdin lines via callback: (line, index) -> echo result.
+# -----------------------------------------------------------------------------
+# Reads from stdin using `read -r` (preserving backslashes) and invokes the
+# callback for each line, passing both the line content and its zero-based index.
+#
+# Usage:
+#   ... | boot::pipe_map cb
+#
+# @param string $1  Callback function or command.
+# @return 0         On success.
+# @return 127       If callback not callable.
+#
+# @example
+#   print_idx(){ printf '%s => %s\n' "$2" "$1"; }
+#   printf '%s\n' a b c | boot::pipe_map print_idx
+##**
+boot::pipe_map() {
+  local cb="${1:?missing callback}"
+  boot::__require_callable "$cb" || return $?
+  local line i=0
+  while IFS= read -r line; do
+    "$cb" "$line" "$i"
+    ((i++))
+  done
+}
+
+##**
+# Filter stdin lines via predicate: (line, index) -> exit 0 to keep.
+# -----------------------------------------------------------------------------
+# Reads lines from stdin and prints only those for which the predicate exits 0.
+# Backslashes are preserved (`read -r`).
+#
+# Usage:
+#   ... | boot::pipe_filter pred
+#
+# @param string $1  Predicate function or command.
+# @return 0         On success.
+# @return 127       If predicate not callable.
+#
+# @example
+#   starts_with_hash(){ [[ "$1" == \#* ]]; }
+#   printf '%s\n' "#a" "b" "#c" | boot::pipe_filter starts_with_hash
+#   # Output: "#a" and "#c"
+##**
+boot::pipe_filter() {
+  local pd="${1:?missing predicate}"
+  boot::__require_callable "$pd" || return $?
+  local line i=0
+  while IFS= read -r line; do
+    if "$pd" "$line" "$i"; then
+      printf '%s\n' "$line"
+    fi
+    ((i++))
+  done
+}
 
 return 0 2>/dev/null || true
