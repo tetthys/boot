@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 # boot/boot.sh - Unified entrypoint for all boot modules
 # Loads, in order:
-#   1) core.sh      (strict/log/try/retry/cache/arrays/locks)
-#   2) ui.sh        (Python Rich UI interface)
-#   3) network.sh   (HTTP/TLS/ALPN helpers)
-#   4) path.sh      (Windows <-> WSL path helpers)
 #
 # Usage:
 #   source "/path/to/boot/boot.sh"
