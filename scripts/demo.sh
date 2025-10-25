@@ -48,7 +48,7 @@ EV=(
 boot::ui::timeline EV
 
 ## Spinner & Progress ----------------------------------------------------------
-boot::spinner -- bash -lc 'sleep 0.5' "Preparing environment"
+boot::spinner --label "Preparing environment" -- bash -lc 'sleep 0.5'
 for p in 0 20 40 60 80 100; do boot::progress "$p" "Working"; sleep 0.05; done
 boot::hr
 

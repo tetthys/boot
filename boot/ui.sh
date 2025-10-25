@@ -98,33 +98,6 @@ boot::progress(){
 }
 
 ##**
-# Spinner for a long-running command.
-# @param string -- sentinel
-# @param string ... command
-# @param string $? label (optional; first non-option after --)
-# @return int command exit code
-##*
-boot::spinner(){
-  local -a CMD=() ; local lbl="" rc spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0
-  while [[ $# -gt 0 ]]; do
-    if [[ "$1" == "--" ]]; then shift; break; else CMD+=("$1"); shift; fi
-  done
-  lbl="${1:-}"; [[ -n "$lbl" ]] && shift || true
-  [[ ${#CMD[@]} -eq 0 ]] && { boot::log error "spinner: no command"; return 2; }
-  "${CMD[@]}" & local pid=$!
-  while kill -0 "$pid" 2>/dev/null; do
-    local c="${spin:i%${#spin}:1}"; i=$((i+1))
-    printf "%s%s%s %s\r" "$_C_CYA" "$c" "$_C_RESET" "$lbl"
-    sleep 0.08
-  done
-  wait "$pid"; rc=$?
-  (( rc==0 )) && printf "%s✔%s %s\n" "$_C_GRN" "$_C_RESET" "$lbl" || printf "%s✖%s %s (rc=%d)\n" "$_C_RED" "$_C_RESET" "$lbl" "$rc"
-  return "$rc"
-}
-
-# -------------------------- Tables / Key-Value / Timeline ---------------------
-
-##**
 # Render a simple ASCII table.
 # - Rows are split by a delimiter (default: TAB). No nested arrays needed.
 # @param nameref $1 headers (array of strings)
@@ -136,12 +109,13 @@ boot::spinner(){
 #   boot::ui::table HEAD ROWS
 ##*
 boot::ui::table() {
-  local -n HEAD="${1:?}" ROWS="${2:?}"; local DELIM="${3:-$'\t'}"
-  local -a W=() ; local cols=${#HEAD[@]} r c cell
+  local -n __HEAD="${1:?}" __ROWS="${2:?}"; local DELIM="${3:-$'\t'}"
+  local -a W=()
+  local cols=${#__HEAD[@]} r c cell
   # widths by header
-  for ((c=0;c<cols;c++)); do W[c]=${#HEAD[c]}; done
+  for ((c=0;c<cols;c++)); do W[c]=${#__HEAD[c]}; done
   # widths by data
-  for r in "${ROWS[@]}"; do
+  for r in "${__ROWS[@]}"; do
     IFS="$DELIM" read -r -a _F <<<"$r"
     for ((c=0;c<cols;c++)); do cell="${_F[c]:-}"; (( ${#cell} > W[c] )) && W[c]=${#cell}; done
   done
@@ -149,10 +123,10 @@ boot::ui::table() {
   local sep="+"; for ((c=0;c<cols;c++)); do sep+="$(printf -- '-%.0s' $(seq 1 $((W[c]+2))))+"; done
   printf "%s\n" "$sep"
   # header
-  printf "|"; for ((c=0;c<cols;c++)); do printf " %-${W[c]}s |" "${HEAD[c]}"; done; printf "\n"
+  printf "|"; for ((c=0;c<cols;c++)); do printf " %-${W[c]}s |" "${__HEAD[c]}"; done; printf "\n"
   printf "%s\n" "$sep"
   # rows
-  for r in "${ROWS[@]}"; do
+  for r in "${__ROWS[@]}"; do
     IFS="$DELIM" read -r -a _F <<<"$r"
     printf "|"
     for ((c=0;c<cols;c++)); do printf " %-${W[c]}s |" "${_F[c]:-}"; done
@@ -170,10 +144,10 @@ boot::ui::table() {
 #   boot::ui::kv_dump M 2
 ##*
 boot::ui::kv_dump() {
-  local -n M="${1:?}" ; local pad="${2:-0}" k max=0
-  for k in "${!M[@]}"; do (( ${#k} > max )) && max=${#k}; done
-  for k in "${!M[@]}"; do
-    printf "%*s%-*s : %s\n" "$pad" "" "$max" "$k" "${M[$k]}"
+  local -n __MAP="${1:?}" ; local pad="${2:-0}" k max=0
+  for k in "${!__MAP[@]}"; do (( ${#k} > max )) && max=${#k}; done
+  for k in "${!__MAP[@]}"; do
+    printf "%*s%-*s : %s\n" "$pad" "" "$max" "$k" "${__MAP[$k]}"
   done
 }
 
@@ -186,14 +160,55 @@ boot::ui::kv_dump() {
 #   boot::ui::timeline EV
 ##*
 boot::ui::timeline() {
-  local -n EV="${1:?}" ; local left=0 e t msg bar
+  local -n __EV="${1:?}" ; local left=0 e t msg bar
   # measure left column width
-  for e in "${EV[@]}"; do IFS=$'\t' read -r t msg <<<"$e"; (( ${#t} > left )) && left=${#t}; done
-  for e in "${EV[@]}"; do
+  for e in "${__EV[@]}"; do IFS=$'\t' read -r t msg <<<"$e"; (( ${#t} > left )) && left=${#t}; done
+  for e in "${__EV[@]}"; do
     IFS=$'\t' read -r t msg <<<"$e"
     printf "%-${left}s %s %s\n" "$t" "●" "$msg"
     bar="$(printf '%*s' "$left" '')"
     printf "%s │\n" "$bar"
   done
 }
-return 0 2>/dev/null || true
+
+##**
+# Spinner for a long-running command.
+# Usage: boot::spinner [--label TEXT] -- cmd arg...
+# @option --label TEXT   Label to show while spinning
+# @return int command exit code
+# @example
+#   boot::spinner --label "Preparing" -- bash -lc 'sleep 0.5'
+##*
+boot::spinner(){
+  local lbl="" rc spin='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0
+  # parse optional --label
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --label) lbl="${2:-}"; shift 2;;
+      --) shift; break;;
+      *) break;;
+    esac
+  done
+  local -a CMD=( "$@" )
+  if [[ ${#CMD[@]} -eq 0 ]]; then
+    boot::log error "spinner: no command"
+    return 2
+  fi
+  "${CMD[@]}" & local pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    local c="${spin:i%${#spin}:1}"; i=$((i+1))
+    if [[ -n "$lbl" ]]; then
+      printf "%s%s%s %s\r" "$_C_CYA" "$c" "$_C_RESET" "$lbl"
+    else
+      printf "%s%s%s\r" "$_C_CYA" "$c" "$_C_RESET"
+    fi
+    sleep 0.08
+  done
+  wait "$pid"; rc=$?
+  if [[ -n "$lbl" ]]; then
+    (( rc==0 )) && printf "%s✔%s %s\n" "$_C_GRN" "$_C_RESET" "$lbl" || printf "%s✖%s %s (rc=%d)\n" "$_C_RED" "$_C_RESET" "$lbl" "$rc"
+  else
+    (( rc==0 )) && printf "%s✔%s\n" "$_C_GRN" "$_C_RESET" || printf "%s✖%s (rc=%d)\n" "$_C_RED" "$_C_RESET" "$rc"
+  fi
+  return "$rc"
+}
