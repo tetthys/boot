@@ -83,18 +83,45 @@ boot::banner(){ local text="${1:?}" bar; bar=$(printf '%*s' "${COLUMNS:-80}" '' 
 boot::hr(){ printf "%s\n" "$(printf '%*s' "${COLUMNS:-80}" '' | tr ' ' '─')"; }
 
 ##**
-# Simple progress bar (single-line, 0..100).
-# @param int    $1 percent
+# Simple progress bar (single-line, 0..100). Always returns 0.
+# @param int    $1 percent (0..100; non-integers are coerced to 0..100)
 # @param string $2 label
-# @return void
+# @return int 0
 ##*
 boot::progress(){
-  local p="${1:?}" lbl="${2:-}" w filled empty
-  (( p<0 )) && p=0; (( p>100 )) && p=100
-  w=$(( (${COLUMNS:-60} - 10) )); (( w<10 )) && w=10
-  filled=$(( p*w/100 )) ; empty=$(( w-filled ))
-  printf "%s[%s%s]%s %3d%% %s\r" "$_C_GRY" "$_C_GRN$(printf '%*s' "$filled" '' | tr ' ' '#')" "$(printf '%*s' "$empty" '' | tr ' ' '-')" "$_C_RESET" "$p" "$lbl"
-  (( p == 100 )) && printf "\n"
+  local p_raw="${1:-0}" lbl="${2:-}"
+  # sanitize percent → integer 0..100
+  local p=0
+  if [[ "$p_raw" =~ ^[0-9]+$ ]]; then
+    p="$p_raw"
+  else
+    p=0
+  fi
+  (( p<0 )) && p=0
+  (( p>100 )) && p=100
+
+  # sanitize columns
+  local cols="${COLUMNS:-60}"
+  if ! [[ "$cols" =~ ^[0-9]+$ ]]; then cols=60; fi
+  (( cols<20 )) && cols=20
+
+  # compute bar width safely
+  local w=$(( cols - 10 ))
+  (( w<10 )) && w=10
+
+  local filled=$(( p*w/100 ))
+  local empty=$(( w-filled ))
+
+  # build segments
+  local seg_f seg_e
+  seg_f="$(printf '%*s' "$filled"  '' | tr ' ' '#')"
+  seg_e="$(printf '%*s' "$empty"   '' | tr ' ' '-')"
+
+  # render (use carriage return; newline only at 100%)
+  printf "[%s%s] %3d%% %s\r" "$seg_f" "$seg_e" "$p" "$lbl"
+  if (( p == 100 )); then printf "\n"; fi
+
+  return 0
 }
 
 ##**
