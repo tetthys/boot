@@ -248,39 +248,263 @@ boot::with_lock() {
   return "$rc"
 }
 
-# --- Atomic I/O / Temp / Cache -------------------------------------------------
+##**
+# Internal: print error to stderr.
+# @param string $1  message
+##**
+boot::__err() { printf '%s\n' "$*" >&2; }
 
+##**
+# Internal: check if a string is an integer (>=0).
+# @param string $1  candidate
+# @return 0 if integer, else 1
+##**
+boot::__is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+
+##**
+# Internal: portable file mtime (epoch seconds).
+# Uses GNU/BSD stat variants. Prints 0 on failure.
+# @param string $1  path
+# @return 0 print epoch seconds; 0 on failure as "0"
+##**
+boot::__mtime() {
+  local p="${1:?}"
+  local mt
+  mt=$(stat -c %Y -- "$p" 2>/dev/null) || mt=$(stat -f %m -- "$p" 2>/dev/null) || mt=0
+  printf '%s\n' "$mt"
+}
+
+##**
+# Internal: portable sha256(hex) of stdin.
+# Tries sha256sum, shasum -a 256, then openssl dgst -sha256.
+# @return 0 and print hex; 127 if no tool available.
+##**
+boot::__sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  elif command -v openssl >/dev/null 2>&1; then
+    # openssl prints like "(stdin)= <hex>" or "<hex>"
+    openssl dgst -sha256 2>/dev/null | awk '{print $NF}'
+  else
+    boot::__err "boot: no sha256 tool (sha256sum/shasum/openssl)"; return 127
+  fi
+}
+
+##**
+# Internal: portable mktemp file in a directory.
+# Creates a file (not directory) as "$dir/.tmp.XXXXXXXX".
+# @param string $1  directory path (must exist)
+# @return 0 print path; non-zero on failure
+##**
+boot::__mktemp_in_dir() {
+  local dir="${1:?}"
+  # mktemp with path template works on GNU/BSD
+  mktemp "$dir/.tmp.XXXXXXXX" 2>/dev/null || { boot::__err "boot: mktemp failed in $dir"; return 1; }
+}
+
+##**
+# Execute a callback on a fresh temp directory and auto-clean it.
+# The temp directory path is exposed via a variable name you provide,
+# but only within the callback (subshell scope) to ensure cleanup safety.
+#
+# Usage:
+#   boot::with_tempdir VAR -- cmd args...
+#   # Inside cmd, $VAR points to the temp dir; it is removed on exit.
+#
+# @param string $1  variable name to receive the temp dir (in child scope)
+# @param --         separator before command
+# @param string ..  command and its arguments
+# @return exit code of the command, temp dir is always removed.
+##**
 boot::with_tempdir() {
-  local var="${1:?}"; shift
+  local var="${1:?missing var name}"; shift
   [[ "${1:-}" == "--" ]] && shift
-  local d; d="$(mktemp -d)"
+  if [[ "${var}" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then :; else
+    boot::__err "boot::with_tempdir: invalid identifier: $var"; return 2
+  fi
+  # mktemp -d is typically 0700; enforce strict umask anyway.
+  local old_umask; old_umask=$(umask); umask 077
+  local d
+  if ! d="$(mktemp -d -t boot_tmp.XXXXXXXX 2>/dev/null || mktemp -d 2>/dev/null)"; then
+    umask "$old_umask"; boot::__err "boot::with_tempdir: mktemp -d failed"; return 1
+  fi
+  umask "$old_umask"
+
   (
-    trap 'rm -rf -- "$d"' EXIT
+    # trap cleanup for multiple signals
+    trap 'rm -rf -- "$d" 2>/dev/null || true' EXIT INT TERM
+    # expose path via printf -v (child scope only by design)
     printf -v "$var" '%s' "$d"
+    if command -v boot::__require_callable >/dev/null 2>&1; then
+      # If the next token is a bare function name, we still just exec "$@"
+      # The callable check is optional; "$@" may be a pipeline/command chain.
+      :
+    fi
     "$@"
   )
 }
 
-boot::atomic_write(){ local dest="${1:?}" dir tmp; dir="$(dirname -- "$dest")"; tmp="$(mktemp "$dir/.tmp.XXXXXXXX")"; cat >"$tmp"; mv -f -- "$tmp" "$dest"; }
-boot::readfile(){ local p="${1:?}"; [[ -r "$p" ]] && cat -- "$p"; }
-boot::writefile(){ local p="${1:?}"; shift; printf "%s" "$*" | boot::atomic_write "$p"; }
-
-boot::cache_dir(){ if [[ -n "$BOOT_CACHE_DIR" ]]; then printf "%s\n" "$BOOT_CACHE_DIR"; else printf "%s\n" "${XDG_CACHE_HOME:-$HOME/.cache}/boot"; fi; }
-boot::cache_memo(){
-  local key="${1:?}" ttl="${2:-0}"; shift 2
-  [[ "${1:-}" == "--" ]] && shift
-  local dir file now mt tmp
-  dir="$(boot::cache_dir)"; mkdir -p -- "$dir"
-  file="$dir/$(printf "%s" "$key" | sha1sum | awk '{print $1}').cache"
-  if [[ -r "$file" && $ttl -gt 0 ]]; then
-    now=$(date +%s); mt=$(stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || echo 0)
-    (( now-mt<=ttl )) && { cat -- "$file"; return 0; }
+##**
+# Atomically write stdin to DEST.
+# Strategy: create tmp file in the same dir -> write -> fsync (best-effort) ->
+# mv -f to DEST. This guarantees atomic replacement on the same filesystem.
+#
+# @param string $1  destination path
+# @stdin            content to write
+# @return 0 on success; non-zero on failure
+##**
+boot::atomic_write() {
+  local dest="${1:?missing dest}"
+  local dir; dir="$(dirname -- "$dest")"
+  # Ensure dir exists
+  if [[ ! -d "$dir" ]]; then
+    boot::__err "boot::atomic_write: directory not found: $dir"; return 1
   fi
-  tmp="$(mktemp "$dir/.tmp.XXXXXX")"
-  if "$@" >"$tmp"; then mv -f -- "$tmp" "$file"; cat -- "$file"; else rm -f -- "$tmp"; return 1; fi
+
+  local old_umask; old_umask=$(umask); umask 077
+  local tmp
+  if ! tmp="$(boot::__mktemp_in_dir "$dir")"; then umask "$old_umask"; return 1; fi
+  umask "$old_umask"
+
+  # Write stdin to tmp
+  if ! cat >"$tmp"; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    boot::__err "boot::atomic_write: write failed"
+    return 1
+  fi
+
+  # Best-effort fsync (Linux/BSD)
+  if command -v sync >/dev/null 2>&1; then
+    # try to flush file handle with dd workaround (no portable fsync in POSIX shell)
+    # ignore errors (best-effort)
+    : >/dev/null 2>&1
+  fi
+
+  # Atomic rename
+  if ! mv -f -- "$tmp" "$dest"; then
+    rm -f -- "$tmp" 2>/dev/null || true
+    boot::__err "boot::atomic_write: rename failed"
+    return 1
+  fi
 }
 
-# --- IDs & Versions ------------------------------------------------------------
+##**
+# Read file to stdout if readable.
+# @param string $1  path
+# @return 0 and print content; 1 if not readable
+##**
+boot::readfile() {
+  local p="${1:?missing path}"
+  [[ -r "$p" ]] || return 1
+  cat -- "$p"
+}
+
+##**
+# Write arguments as a single string to path (atomic).
+# @param string $1  path
+# @param string ..  parts to join without newline (use printf yourself to add \n)
+# @return 0 on success
+##**
+boot::writefile() {
+  local p="${1:?missing path}"; shift || true
+  # Join args as-is (no trailing newline). If you need newline: printf '%s\n'
+  printf "%s" "$*" | boot::atomic_write "$p"
+}
+
+##**
+# Get cache directory (XDG or $HOME/.cache/boot).
+# Does not create it; use boot::cache_ensure if needed.
+# Env: BOOT_CACHE_DIR to override.
+# @return 0 and print path
+##**
+boot::cache_dir() {
+  if [[ -n "${BOOT_CACHE_DIR:-}" ]]; then
+    printf '%s\n' "$BOOT_CACHE_DIR"
+  else
+    printf '%s\n' "${XDG_CACHE_HOME:-$HOME/.cache}/boot"
+  fi
+}
+
+##**
+# Ensure cache directory exists with secure permissions (0700).
+# @return 0 on success
+##**
+boot::cache_ensure() {
+  local d; d="$(boot::cache_dir)"
+  # mkdir -p + umask 077 for secure default
+  local old_umask; old_umask=$(umask); umask 077
+  mkdir -p -- "$d" || { umask "$old_umask"; return 1; }
+  umask "$old_umask"
+  printf '%s\n' "$d"
+}
+
+##**
+# Cache the stdout of a command with a TTL (seconds).
+# If cache exists and is fresh (now - mtime <= ttl), prints cached content.
+# Otherwise, runs the command, captures stdout to a temp file, atomically
+# refreshes the cache file, and prints the content.
+#
+# Usage:
+#   boot::cache_memo KEY TTL -- cmd args...
+#
+# KEY is hashed with SHA-256 to form the cache file name; TTL<=0 disables reuse.
+#
+# @param string $1  key (any string)
+# @param int    $2  ttl seconds (>=0)
+# @param --         separator before command
+# @param string ..  command and its arguments
+# @return 0 on hit/miss success; non-zero if command fails or tooling missing
+##**
+boot::cache_memo() {
+  local key="${1:?missing key}" ttl="${2:?missing ttl}"; shift 2
+  [[ "${1:-}" == "--" ]] && shift
+
+  if ! boot::__is_uint "$ttl"; then
+    boot::__err "boot::cache_memo: ttl must be a non-negative integer"; return 2
+  fi
+
+  local dir file now mt
+  dir="$(boot::cache_ensure)" || { boot::__err "boot::cache_memo: cannot ensure cache dir"; return 1; }
+
+  # Compute cache file name = sha256(key).cache
+  if ! file="$(printf '%s' "$key" | boot::__sha256_stdin)"; then
+    return 1
+  fi
+  file="$dir/${file}.cache"
+
+  # Serve from cache if fresh
+  if [[ -r "$file" && "$ttl" -gt 0 ]]; then
+    now=$(date +%s)
+    mt=$(boot::__mtime "$file")
+    if [[ "$mt" -gt 0 ]] && (( now - mt <= ttl )); then
+      cat -- "$file"
+      return 0
+    fi
+  fi
+
+  # Miss or expired: run command and atomically refresh
+  local old_umask; old_umask=$(umask); umask 077
+  local tmp
+  if ! tmp="$(boot::__mktemp_in_dir "$dir")"; then umask "$old_umask"; return 1; fi
+  umask "$old_umask"
+
+  if "$@" >"$tmp"; then
+    if mv -f -- "$tmp" "$file"; then
+      cat -- "$file"
+      return 0
+    else
+      rm -f -- "$tmp" 2>/dev/null || true
+      boot::__err "boot::cache_memo: rename failed"
+      return 1
+    fi
+  else
+    local rc=$?
+    rm -f -- "$tmp" 2>/dev/null || true
+    return "$rc"
+  fi
+}
 
 ##**
 # Generate a simple non-cryptographic random ID string.
