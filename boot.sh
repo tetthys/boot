@@ -1,25 +1,35 @@
-# boot.sh - Single entry to load core, UI, path, and network helpers.
+#!/usr/bin/env bash
+# boot/boot.sh - Unified entrypoint for all boot modules
+# Loads, in order:
+#   1) core.sh      (strict/log/try/retry/cache/arrays/locks)
+#   2) ui.sh        (Python Rich UI interface)
+#   3) network.sh   (HTTP/TLS/ALPN helpers)
+#   4) path.sh      (Windows <-> WSL path helpers)
+#
+# Usage:
+#   source "/path/to/boot/boot.sh"
+#   boot::strict
+#   boot::log info "hello"
+#
+# All modules are required to exist; boot.sh will fail fast if missing.
 
-if [[ -n "${_BOOT_ENTRY_LOADED:-}" ]]; then return 0; fi
-readonly _BOOT_ENTRY_LOADED=1
+if [[ -n "${_BOOT_MAIN_LOADED:-}" ]]; then
+  return 0
+fi
+readonly _BOOT_MAIN_LOADED=1
 
+# Resolve absolute path of this file
 _BOOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
-# core (required)
-if [[ -r "${_BOOT_DIR}/boot/core.sh" ]]; then
-  # shellcheck source=boot/core.sh
-  source "${_BOOT_DIR}/boot/core.sh"
-else
-  printf >&2 "boot/core.sh not found. Aborting.\n"; return 1
-fi
-
-# ui (optional)
-[[ -r "${_BOOT_DIR}/boot/ui.sh" ]] && source "${_BOOT_DIR}/boot/ui.sh"
-
-# path (optional but recommended)
-[[ -r "${_BOOT_DIR}/boot/path.sh" ]] && source "${_BOOT_DIR}/boot/path.sh"
-
-# network (optional)
-[[ -r "${_BOOT_DIR}/boot/network.sh" ]] && source "${_BOOT_DIR}/boot/network.sh"
+# --- required modules ---------------------------------------------------------
+for req in core ui network path; do
+  file="${_BOOT_DIR}/${req}.sh"
+  if [[ ! -r "$file" ]]; then
+    printf >&2 "[boot] missing required module: %s\n" "$file"
+    return 1
+  fi
+  # shellcheck source=/dev/null
+  source "$file"
+done
 
 return 0 2>/dev/null || true

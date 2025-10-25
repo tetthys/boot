@@ -1,98 +1,105 @@
 #!/usr/bin/env bash
-# scripts/demo.sh - Minimal showcase for boot UI (Python Rich)
-# Requirements:
-#   - python3
-#   - pip install rich
-# Files:
-#   - boot/boot_ui.py
-#   - boot/ui.sh
+# scripts/demo.sh - Unified demo for the boot framework
+# Demonstrates usage of: core, ui, network, path
 #
-# What this demo shows:
-#   - Logging (levels, JSON/file sinks via env)
-#   - Banner / Horizontal rule
-#   - Table (with sorting / descending)
-#   - Key-Value dump (assoc array)
-#   - Timeline block
-#   - Spinner (runs a command)
-#   - Progress (one-shot render, called repeatedly)
+# Usage:
+#   bash scripts/demo.sh
 
 set -Eeuo pipefail
-
-# Resolve project root and source the UI wrapper
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-# shellcheck source=/dev/null
-source "${ROOT}/boot/ui.sh"
+source "${ROOT}/boot.sh"
 
-# Optional: tweak theme/format/sinks here (uncomment to try)
-# export BOOT_THEME=light          # light|dark|mono
-# export BOOT_LOG_FORMAT=json      # text|json
-# export BOOT_LOG_FILE="${ROOT}/demo.log"
-# export BOOT_LOG_JSON_FILE="${ROOT}/demo.jsonl"
+boot::strict
 
-boot::banner "Boot UI Demo"
+# --- demo start ---------------------------------------------------------------
+boot::banner "Boot Framework Demo"
+boot::log info "Boot version: ${BOOT_VERSION:-unknown}"
+boot::log info "All modules loaded successfully"
 
-# --- Logging levels ------------------------------------------------------------
-boot::log debug   "Debug message (may be hidden depending on your log viewer)"
-boot::log info    "Information message"
-boot::log notice  "Notice message"
-boot::log warn    "Warning message"
-boot::log error   "Error message"
-boot::log success "Success message"
-
+# --- CORE ---------------------------------------------------------------------
 boot::hr
+boot::banner "Core Utilities"
 
-# --- Table (with sorting) ------------------------------------------------------
-HEAD=(ID Name Score)
-ROWS=(
-  $'1\tAlice\t98'
-  $'2\tBob\t87'
-  $'3\tCharlie\t91'
-  $'4\tDana\t70'
-)
-boot::log info "Table: unsorted"
-boot::ui::table HEAD ROWS
+boot::log info "Testing safe try()"
+OUT="" ERR=""
+if boot::try OUT ERR -- bash -lc 'echo "ok"; >&2 echo "warn"' ; then
+  boot::log success "OUT='$OUT' ERR='$ERR'"
+fi
 
-boot::log info "Table: sort by Score (desc)"
-boot::ui::table HEAD ROWS --sort Score --desc
+boot::log info "Testing retry() with exponential backoff"
+boot::retry 3 boot::backoff_expo 0.1 -- bash -lc 'false' || boot::log warn "retry() gave up as expected"
 
+boot::log info "Testing cache memoization"
+boot::cache_memo "time_1s" 2 -- date +%s
+
+# --- NETWORK ------------------------------------------------------------------
 boot::hr
+boot::banner "Network Utilities"
 
-# --- Key-Value dump ------------------------------------------------------------
-declare -A META=(
-  [project]=boot
-  [component]=ui
-  [backend]=python-rich
-  [theme]="${BOOT_THEME:-dark}"
-)
-boot::ui::kv_dump META 2
+if declare -F boot::net_http >/dev/null; then
+  BODY="" CODE=""
+  boot::log info "Fetching https://httpbin.org/get"
+  if boot::net_http GET "https://httpbin.org/get" BODY CODE --timeout 3; then
+    boot::log success "HTTP $CODE (body.len=${#BODY})"
+  else
+    boot::log error "HTTP request failed"
+  fi
+fi
 
+if declare -F boot::tls_expiry >/dev/null; then
+  EXP="$(boot::tls_expiry google.com:443 --cache-ttl 300 || true)"
+  boot::log info "TLS expiry for google.com: $EXP"
+fi
+
+if declare -F boot::alpn >/dev/null; then
+  ALPN="$(boot::alpn google.com:443 || true)"
+  boot::log info "ALPN negotiated: $ALPN"
+fi
+
+# --- PATH ---------------------------------------------------------------------
 boot::hr
+boot::banner "Path Helpers"
 
-# --- Timeline ------------------------------------------------------------------
-EVENTS=(
-  $'10:00\tStart demo'
-  $'10:05\tShow logging'
-  $'10:10\tShow table'
-  $'10:15\tShow key-value'
-  $'10:20\tShow timeline'
-  $'10:25\tRun spinner'
-  $'10:30\tRender progress'
-  $'10:35\tFinish'
-)
-boot::ui::timeline EVENTS
+if declare -F boot::path_win2wsl >/dev/null; then
+  boot::log info "Win2WSL: $(boot::path_win2wsl 'C:\\Users\\Alice\\project')"
+fi
 
+if declare -F boot::path_wsl2win >/dev/null; then
+  boot::log info "WSL2Win: $(boot::path_wsl2win '/mnt/c/Users/Alice/project')"
+fi
+
+if declare -F boot::path_normalize >/dev/null; then
+  boot::log info "Normalize: $(boot::path_normalize './tmp/../boot')"
+fi
+
+# --- UI / VISUAL --------------------------------------------------------------
 boot::hr
+boot::banner "UI Showcase"
 
-# --- Spinner -------------------------------------------------------------------
-boot::log info "Spinner: running a short task..."
-boot::spinner --label "Simulating work (0.6s)" -- bash -lc 'sleep 0.6'
+if declare -F boot::ui_table >/dev/null; then
+  HEADERS=("ID" "Name" "Score")
+  ROWS=("1|Alice|98" "2|Bob|87" "3|Charlie|91")
+  boot::ui_table HEADERS ROWS
+fi
 
-# --- Progress ------------------------------------------------------------------
-boot::log info "Progress: 0..100%"
-for p in 0 20 40 60 80 100; do
-  boot::progress "$p" "Working..."
-  sleep 0.05
-done
+if declare -F boot::ui_kv_dump >/dev/null; then
+  declare -A INFO=(
+    [features]="core,ui,network,path"
+    [version]="${BOOT_VERSION}"
+    [lang]="bash"
+  )
+  boot::ui_kv_dump INFO 2
+fi
 
-boot::banner "Demo complete"
-boot::log success "All UI components displayed successfully"
+if declare -F boot::ui_timeline >/dev/null; then
+  EVENTS=("10:00 Start demo" "10:05 Core tests" "10:10 Network" "10:15 Path" "10:20 UI done")
+  boot::ui_timeline EVENTS
+fi
+
+boot::spinner --label "Preparing environment..." -- sleep 1
+boot::progress 80 "Almost done..."
+
+# --- DONE ---------------------------------------------------------------------
+boot::hr
+boot::banner "Demo Complete"
+boot::log success "✅ All boot subsystems working properly!"
