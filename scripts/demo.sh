@@ -1,150 +1,98 @@
 #!/usr/bin/env bash
-# scripts/demo.sh - Boot toolkit end-to-end demo (UI, PATH, NETWORK)
-# Requires: Bash 5+, curl (for HTTP), openssl (for TLS/ALPN demo, optional)
+# scripts/demo.sh - Minimal showcase for boot UI (Python Rich)
+# Requirements:
+#   - python3
+#   - pip install rich
+# Files:
+#   - boot/boot_ui.py
+#   - boot/ui.sh
+#
+# What this demo shows:
+#   - Logging (levels, JSON/file sinks via env)
+#   - Banner / Horizontal rule
+#   - Table (with sorting / descending)
+#   - Key-Value dump (assoc array)
+#   - Timeline block
+#   - Spinner (runs a command)
+#   - Progress (one-shot render, called repeatedly)
 
 set -Eeuo pipefail
 
-##**
-# Resolve repo root and load boot.
-# - Assumes: boot.sh at repo root that sources core/ui/path/network.
-##*
+# Resolve project root and source the UI wrapper
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 # shellcheck source=/dev/null
-source "${ROOT}/boot.sh"
+source "${ROOT}/boot/ui.sh"
 
-boot::strict
-BOOT_LOG_LEVEL="${BOOT_LOG_LEVEL:-debug}"  # can override externally
+# Optional: tweak theme/format/sinks here (uncomment to try)
+# export BOOT_THEME=light          # light|dark|mono
+# export BOOT_LOG_FORMAT=json      # text|json
+# export BOOT_LOG_FILE="${ROOT}/demo.log"
+# export BOOT_LOG_JSON_FILE="${ROOT}/demo.jsonl"
 
-boot::banner "Boot Demo (version ${BOOT_VERSION:-N/A})"
+boot::banner "Boot UI Demo"
 
-# ==============================================================================
-# UI SHOWCASE
-# ==============================================================================
+# --- Logging levels ------------------------------------------------------------
+boot::log debug   "Debug message (may be hidden depending on your log viewer)"
+boot::log info    "Information message"
+boot::log notice  "Notice message"
+boot::log warn    "Warning message"
+boot::log error   "Error message"
+boot::log success "Success message"
 
-boot::log info "UI showcase: table / key-value / timeline / spinner / progress"
+boot::hr
 
-## Table -----------------------------------------------------------------------
+# --- Table (with sorting) ------------------------------------------------------
 HEAD=(ID Name Score)
-ROWS=($'1\tAlice\t98' $'2\tBob\t87' $'3\tCharlie\t91')
+ROWS=(
+  $'1\tAlice\t98'
+  $'2\tBob\t87'
+  $'3\tCharlie\t91'
+  $'4\tDana\t70'
+)
+boot::log info "Table: unsorted"
 boot::ui::table HEAD ROWS
 
-## Key-Value dump --------------------------------------------------------------
-declare -A INFO=(
-  [project]="boot"
-  [language]="bash"
-  [features]="ui,path,network"
-  [version]="${BOOT_VERSION:-N/A}"
-)
-boot::ui::kv_dump INFO 2
+boot::log info "Table: sort by Score (desc)"
+boot::ui::table HEAD ROWS --sort Score --desc
 
-## Timeline --------------------------------------------------------------------
-EV=(
+boot::hr
+
+# --- Key-Value dump ------------------------------------------------------------
+declare -A META=(
+  [project]=boot
+  [component]=ui
+  [backend]=python-rich
+  [theme]="${BOOT_THEME:-dark}"
+)
+boot::ui::kv_dump META 2
+
+boot::hr
+
+# --- Timeline ------------------------------------------------------------------
+EVENTS=(
   $'10:00\tStart demo'
-  $'10:05\tUI showcase'
-  $'10:10\tPATH helpers'
-  $'10:15\tNETWORK checks'
-  $'10:20\tFinish'
+  $'10:05\tShow logging'
+  $'10:10\tShow table'
+  $'10:15\tShow key-value'
+  $'10:20\tShow timeline'
+  $'10:25\tRun spinner'
+  $'10:30\tRender progress'
+  $'10:35\tFinish'
 )
-boot::ui::timeline EV
-
-## Spinner & Progress ----------------------------------------------------------
-boot::spinner --label "Preparing environment" -- bash -lc 'sleep 0.5'
-for p in 0 20 40 60 80 100; do boot::progress "$p" "Working" || true; sleep 0.05; done
-boot::hr
-
-# ==============================================================================
-# PATH HELPERS
-# ==============================================================================
-
-boot::log info "PATH helpers"
-
-# Join / abs / rel
-joined="$(boot::path::join_e "/var" "log" "nginx" "access.log")"
-abs="$(boot::path::abs "$joined")"
-rel="$(boot::path::rel "/var/log" "$abs")"
-boot::log success "join      : $joined"
-boot::log success "abs       : $abs"
-boot::log success "rel(base=/var/log): $rel"
-
-# WSL/Windows conversions
-win_ex="D:\\Work\\data\\file.txt"
-wsl_from_win="$(boot::path::win_to_wsl "$win_ex")"
-wsl_ex="/mnt/c/Users/Public/Documents/Report.pdf"
-win_from_wsl="$(boot::path::wsl_to_win "$wsl_ex")"
-if boot::path::is_wsl; then
-  boot::log notice "WSL detected"
-else
-  boot::log notice "WSL not detected"
-fi
-boot::log success "win->wsl  : $win_ex  ->  $wsl_from_win"
-boot::log success "wsl->win  : $wsl_ex  ->  $win_from_wsl"
-boot::hr
-
-# ==============================================================================
-# NETWORK HELPERS
-# ==============================================================================
-
-boot::log info "NETWORK helpers"
-
-# HTTP GET demo
-if boot::require curl >/dev/null; then
-  body="" status=""
-  boot::net::http GET "https://httpbin.org/get" body status --timeout 6 --max-retry 2
-  boot::log success "httpbin status=$status, body.len=${#body}"
-else
-  boot::log warn "curl not found; skipping HTTP demo"
-fi
-
-# TLS expiry & ALPN (optional: needs openssl)
-if command -v openssl >/dev/null 2>&1; then
-  host="example.com"
-  days="" exp=""
-  if boot::net::tls_expiry "$host" 443 days exp --timeout 8; then
-    boot::log notice "TLS notAfter ($host): $exp"
-    boot::log success "TLS days remaining : $days day(s)"
-  else
-    boot::log warn "TLS expiry check failed for $host"
-  fi
-
-  alpn=""
-  if boot::net::alpn "$host" 443 alpn --timeout 8; then
-    boot::log success "ALPN negotiated    : $alpn"
-  else
-    boot::log warn "ALPN check failed for $host"
-  fi
-
-  # HTTP protocol version (curl-based)
-  ver=""
-  if boot::net::http_version "https://$host" ver; then
-    boot::log success "HTTP version (curl): $ver"
-  fi
-else
-  boot::log warn "openssl not found; skipping TLS/ALPN demo"
-fi
+boot::ui::timeline EVENTS
 
 boot::hr
 
-# ==============================================================================
-# MINI REPORT (table)
-# ==============================================================================
+# --- Spinner -------------------------------------------------------------------
+boot::log info "Spinner: running a short task..."
+boot::spinner --label "Simulating work (0.6s)" -- bash -lc 'sleep 0.6'
 
-boot::log info "Mini report (table rendering)"
+# --- Progress ------------------------------------------------------------------
+boot::log info "Progress: 0..100%"
+for p in 0 20 40 60 80 100; do
+  boot::progress "$p" "Working..."
+  sleep 0.05
+done
 
-HEAD2=("Section" "Item" "Value")
-ROWS2=()
-ROWS2+=($'UI\tTable rows\t3')
-ROWS2+=($'UI\tKV entries\t'"${#INFO[@]}")
-ROWS2+=($'PATH\tWSL?\t'"$(boot::path::is_wsl && echo yes || echo no)")
-if command -v curl >/dev/null 2>&1; then
-  ROWS2+=($'NET\tcurl\tavailable')
-else
-  ROWS2+=($'NET\tcurl\tmissing')
-fi
-if command -v openssl >/dev/null 2>&1; then
-  ROWS2+=($'NET\topenssl\tavailable')
-else
-  ROWS2+=($'NET\topenssl\tmissing')
-fi
-boot::ui::table HEAD2 ROWS2
-
-boot::log success "Demo completed ✅"
+boot::banner "Demo complete"
+boot::log success "All UI components displayed successfully"
