@@ -282,8 +282,59 @@ boot::cache_memo(){
 
 # --- IDs & Versions ------------------------------------------------------------
 
-boot::id_rand(){ printf "%s" "$(date +%s%N)-$RANDOM-$RANDOM"; }
-boot::semver_cmp(){ local a=${1:?} b=${2:?} IFS=. A=($a) B=($b) i x y; for i in 0 1 2; do x="${A[i]:-0}"; y="${B[i]:-0}"; (( x+=0, y+=0 )); (( x<y ))&&{echo -1;return 0;}; (( x>y ))&&{echo 1;return 0;}; done; echo 0; }
+##**
+# Generate a simple non-cryptographic random ID string.
+# Uses time (ns) + RANDOM entropy.
+# @return string id
+# @example
+#   id="$(boot::id_rand)"; echo "$id"
+#   # → 1730123456123456789-12345-6789
+##*
+boot::id_rand() {
+  local t n r1 r2
+  # date +%s%N is nanosecond epoch (Linux only; fallback to seconds)
+  t="$(date +%s%N 2>/dev/null || date +%s)"
+  r1=$RANDOM
+  r2=$RANDOM
+  printf '%s-%d-%d\n' "$t" "$r1" "$r2"
+}
+
+##**
+# Compare two semantic version strings (a.b.c).
+# Returns: -1 if a<b, 0 if equal, 1 if a>b.
+# Handles missing minor/patch by treating them as 0.
+# @param string $1 version A
+# @param string $2 version B
+# @return int comparison result (-1|0|1)
+# @example
+#   boot::semver_cmp 1.2.3 1.10.0   # -> -1
+#   boot::semver_cmp 2.0 1.9.9      # -> 1
+#   boot::semver_cmp 1.0.0 1.0.0    # -> 0
+##*
+boot::semver_cmp() {
+  local verA="${1:-}" verB="${2:-}"
+  if [[ -z "$verA" || -z "$verB" ]]; then
+    printf '%s\n' "0"
+    return 0
+  fi
+
+  local IFS=.
+  local -a A=() B=()
+  # shellcheck disable=SC2206
+  A=($verA)
+  # shellcheck disable=SC2206
+  B=($verB)
+
+  local i x y
+  for i in 0 1 2; do
+    x="${A[i]:-0}"
+    y="${B[i]:-0}"
+    # Force numeric compare; strip leading zeros
+    ((10#$x < 10#$y)) && { printf '%s\n' "-1"; return 0; }
+    ((10#$x > 10#$y)) && { printf '%s\n' "1";  return 0; }
+  done
+  printf '%s\n' "0"
+}
 
 # --- Arrays (functional, nameref-safe) ----------------------------------------
 
