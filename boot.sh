@@ -22,7 +22,7 @@ readonly _BOOT_MAIN_LOADED=1
 _BOOT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 # --- required modules ---------------------------------------------------------
-for req in functional core ui network path; do
+for req in functional control core io id version ui network path; do
   file="${_BOOT_DIR}/${req}.sh"
   if [[ ! -r "$file" ]]; then
     printf >&2 "[boot] missing required module: %s\n" "$file"
