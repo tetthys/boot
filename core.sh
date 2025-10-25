@@ -157,60 +157,278 @@ boot::env_get()     { local n="${1:?}" d="${2:-}"; [[ -n "${!n-}" ]] && echo "${
 
 # --- Try / Retry / Timeout / Lock ---------------------------------------------
 
-##** Capture stdout/stderr of a command into variables (no circular nameref). */
-boot::try() {
-  local -n __out="${1:?}" __err="${2:?}"; shift 2
-  [[ "${1:-}" == "--" ]] && shift
-  local to te rc; to="$(mktemp)"; te="$(mktemp)"
-  if "$@" >"$to" 2>"$te"; then rc=0; else rc=$?; fi
-  __out="$(<"$to")"; __err="$(<"$te")"
-  rm -f -- "$to" "$te"
-  return $rc
+# Optional tiny guards (used if your core guards are not present)
+boot::__has() { command -v "$1" >/dev/null 2>&1; }
+
+if ! boot::__has boot::__require_ident; then
+  ##** Validate a shell identifier (A-Z a-z _; then A-Z a-z 0-9 _). */
+  boot::__require_ident() {
+    local v="${1:?missing ident}"
+    [[ "$v" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] && return 0
+    printf 'boot: error: invalid identifier "%s"\n' "$v" >&2
+    return 2
+  }
+fi
+
+if ! boot::__has boot::__require_callable; then
+  ##** Check whether a name is callable (function/builtin/keyword/file). */
+  boot::__require_callable() {
+    local name="${1:?missing name}"
+    [[ "$(type -t -- "$name" 2>/dev/null)" =~ ^(function|file|builtin|keyword)$ ]] && return 0
+    printf 'boot: error: "%s" not callable\n' "$name" >&2
+    return 127
+  }
+fi
+
+##** Internal: log with optional boot::log fallback to stderr. */
+boot::__log() {
+  local lvl="${1:-info}"; shift || true
+  if boot::__has boot::log; then
+    boot::log "$lvl" "$@"
+  else
+    printf '[%s] %s\n' "$lvl" "$*" >&2
+  fi
 }
 
-##** Backoff helpers. */
-boot::backoff_const(){ printf "%s\n" "${1:-0.2}"; }
-boot::backoff_expo() { awk -v b="${1:-0.2}" -v n="${2:-1}" 'BEGIN{printf "%.6f\n", b*(2^(n-1))}'; }
-boot::backoff_jitter(){ awk -v m="$(awk -v b="${1:-0.5}" -v n="${2:-1}" 'BEGIN{print b*n}')" 'BEGIN{srand(); printf "%.6f\n", rand()*m}'; }
+##** Internal: uint checker (>=0). */
+boot::__is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 
-##** Retry a command with pluggable backoff (function name). */
-boot::retry() {
-  local n="${1:?}" fn="${2:?}" base="${3:-0.2}"; shift 3
+##** Internal: mktemp file safely; prints path. */
+boot::__mktemp_file() {
+  local d="${1:-}"
+  if [[ -n "$d" ]]; then
+    mktemp "$d/.tmp.XXXXXXXX" 2>/dev/null || { printf 'boot: mktemp failed in %s\n' "$d" >&2; return 1; }
+  else
+    mktemp 2>/dev/null || { printf 'boot: mktemp failed\n' >&2; return 1; }
+  fi
+}
+
+##** Internal: start a command in its own process group (if available). */
+boot::__spawn_pg() {
+  # Uses setsid if available to create a new process group/session
+  if boot::__has setsid; then
+    setsid "$@" &
+  else
+    "$@" &
+  fi
+}
+
+##**
+# Capture stdout/stderr of a command into variables (no circular nameref).
+# Safe tempfiles + guaranteed cleanup. Variables must be distinct identifiers.
+#
+# Usage:
+#   boot::try OUT_VAR ERR_VAR -- cmd args...
+#
+# @param string $1 OUT var name
+# @param string $2 ERR var name
+# @param --        separator (optional)
+# @param string .. command and args
+# @return rc of the command; OUT/ERR receive captured text (may be empty)
+##**
+boot::try() {
+  local out_name="${1:?missing OUT var}" err_name="${2:?missing ERR var}"; shift 2
   [[ "${1:-}" == "--" ]] && shift
+
+  boot::__require_ident "$out_name" || return $?
+  boot::__require_ident "$err_name" || return $?
+  if [[ "$out_name" == "$err_name" ]]; then
+    printf 'boot::try: OUT and ERR must be different variables\n' >&2
+    return 2
+  fi
+
+  local -n __out="$out_name" __err="$err_name"
+  __out=""; __err=""
+
+  local to te rc old_umask; old_umask=$(umask); umask 077
+  to="$(boot::__mktemp_file)" || { umask "$old_umask"; return 1; }
+  te="$(boot::__mktemp_file)" || { umask "$old_umask"; rm -f -- "$to"; return 1; }
+  umask "$old_umask"
+
+  # Subshell not required; we capture redirections directly.
+  if "$@" >"$to" 2>"$te"; then rc=0; else rc=$?; fi
+
+  __out="$(<"$to")"
+  __err="$(<"$te")"
+  rm -f -- "$to" "$te" 2>/dev/null || true
+  return "$rc"
+}
+
+# --- Backoff helpers -----------------------------------------------------------
+
+##**
+# Constant backoff: returns base seconds.
+# @param string $1 base (float, default 0.2)
+# @return string seconds (float)
+##**
+boot::backoff_const(){ printf "%s\n" "${1:-0.2}"; }
+
+##**
+# Exponential backoff: base * 2^(n-1)
+# @param string $1 base (float, default 0.2)
+# @param int    $2 attempt index n (>=1, default 1)
+# @return string seconds (float)
+##**
+boot::backoff_expo() {
+  awk -v b="${1:-0.2}" -v n="${2:-1}" 'BEGIN{printf "%.6f\n", b*(2^(n-1))}'
+}
+
+##**
+# Jittered backoff: uniform random in [0, base*n]
+# Uses $RANDOM if available; falls back to awk rand().
+# @param string $1 base (float, default 0.5)
+# @param int    $2 attempt index n (>=1, default 1)
+# @return string seconds (float)
+##**
+boot::backoff_jitter(){
+  local base="${1:-0.5}" n="${2:-1}" m
+  m="$(awk -v b="$base" -v n="$n" 'BEGIN{printf "%.6f\n", b*n}')"
+  if [[ -n "${RANDOM:-}" ]]; then
+    # RANDOM in [0..32767]
+    awk -v r="$RANDOM" -v m="$m" 'BEGIN{printf "%.6f\n", (r/32767.0)*m}'
+  else
+    awk -v m="$m" 'BEGIN{srand(); printf "%.6f\n", rand()*m}'
+  fi
+}
+
+# --- Retry ---------------------------------------------------------------------
+
+##**
+# Retry a command with pluggable backoff. Sleeps between attempts using a
+# backoff function that receives (base, attempt_index) and prints seconds.
+#
+# Usage:
+#   boot::retry N backoff_fn BASE -- cmd args...
+#
+# Notes:
+#   - Returns immediately on first success (rc=0).
+#   - On final failure, returns the command's last rc.
+#   - Logs progress with boot::log if available (warn level).
+#
+# @param int    $1 max attempts (>=1)
+# @param string $2 backoff function name (callable)
+# @param string $3 base seconds (float string)
+# @param --         separator (optional)
+# @param string ..  command and args
+# @return rc        0 if success within N attempts; else last rc
+##**
+boot::retry() {
+  local n="${1:?missing attempts}" fn="${2:?missing backoff fn}" base="${3:-0.2}"; shift 3
+  [[ "${1:-}" == "--" ]] && shift
+
+  boot::__is_uint "$n" || { boot::__log error "retry: attempts must be uint"; return 2; }
+  (( n>=1 )) || { boot::__log error "retry: attempts must be >=1"; return 2; }
+  boot::__require_callable "$fn" || return $?
+
   local i=1 rc d
   while :; do
     "$@" && return 0
     rc=$?
     (( i>=n )) && return "$rc"
     d="$("$fn" "$base" "$i")"
-    boot::log warn "retry $i/$n rc=$rc sleep ${d}s"
+    boot::__log warn "retry $i/$n rc=$rc; sleep ${d}s"
+    # shell sleep accepts fractional seconds in Bash
     sleep "$d"
     ((i++))
   done
 }
 
-##** Timeout wrapper (uses GNU timeout if available, else soft fallback). */
-boot::timeout() {
-  local sec="${1:?}"; shift
-  [[ "${1:-}" == "--" ]] && shift
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$sec" "$@"
-  else
-    ( "$@" ) & local pid=$!
-    ( sleep "$sec"; kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null || true ) &
-    wait "$pid"
-  fi
-}
+# --- Timeout -------------------------------------------------------------------
 
 ##**
-# Exclusive file lock. Prefer flock; fallback to mkdir lock.
-# @option --timeout SEC (default: 30)
-# @return command's rc, or 124 on timeout, 2 on invalid usage
-##*
+# Timeout wrapper. Uses GNU timeout if available; otherwise a portable fallback
+# that starts the command in its own process group and sends TERM then KILL.
+#
+# Usage:
+#   boot::timeout SECONDS -- cmd args...
+#
+# Return codes:
+#   - command's exit code on success/normal finish
+#   - 124 on timeout (GNU timeout compatible)
+#
+# @param string $1 seconds (float/int)
+# @param --        separator (optional)
+# @param string .. command and args
+# @return rc        command rc or 124 on timeout
+##**
+boot::timeout() {
+  local sec="${1:?missing seconds}"; shift
+  [[ "${1:-}" == "--" ]] && shift
+
+  if boot::__has timeout; then
+    timeout "$sec" "$@"
+    return $?
+  fi
+
+  # Fallback: run in new process group (if setsid) so children receive signals
+  boot::__spawn_pg "$@"
+  local pid=$!
+
+  # Convert to integer ceiling for timing loops (fallback simplicity)
+  local int_sec
+  int_sec="$(awk -v s="$sec" 'BEGIN{printf "%d\n", (s==int(s)?s:int(s)+1)}')"
+
+  # Watchdog to enforce timeout
+  (
+    sleep "$int_sec"
+    if kill -0 "$pid" 2>/dev/null; then
+      # Send TERM to the whole process group if possible
+      if boot::__has pkill; then
+        # Try process group via negative pgid (if the shell created it)
+        kill -TERM -"${pid}" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+      else
+        kill -TERM -"${pid}" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+      fi
+      # Grace period then KILL
+      sleep 1
+      kill -0 "$pid" 2>/dev/null && { kill -KILL -"${pid}" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true; }
+      exit 124
+    else
+      exit 0
+    fi
+  ) &
+  local watchdog=$!
+
+  # Wait for main process; capture rc
+  local rc=0
+  wait "$pid" || rc=$?
+
+  # If main finished, stop watchdog
+  if kill -0 "$watchdog" 2>/dev/null; then
+    kill "$watchdog" 2>/dev/null || true
+    wait "$watchdog" 2>/dev/null || true
+    return "$rc"
+  fi
+
+  # Watchdog fired -> timeout
+  return 124
+}
+
+# --- Lock ----------------------------------------------------------------------
+
+##**
+# Execute a command under an exclusive file lock.
+# Prefers flock(1). If not available, falls back to mkdir-based lock.
+#
+# Usage:
+#   boot::with_lock /path/to/lockfile [--timeout SEC] -- cmd args...
+#
+# Return codes:
+#   - command's rc on success
+#   - 124 on timeout
+#   - 2 on invalid usage
+#
+# @param string $1 lock path (file path; directory will be created as needed)
+# @option --timeout SEC  max wait seconds (default 30)
+# @param --              separator (required before cmd)
+# @param string ..       command and args
+# @return rc
+##**
 boot::with_lock() {
   local lock timeout="30"
-  [[ $# -lt 1 ]] && { boot::log error "with_lock: lock path required"; return 2; }
+  [[ $# -lt 1 ]] && { boot::__log error "with_lock: lock path required"; return 2; }
   lock="$1"; shift
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --timeout) timeout="${2:-30}"; shift 2;;
@@ -218,31 +436,48 @@ boot::with_lock() {
       *) break;;
     esac
   done
-  [[ $# -gt 0 ]] || { boot::log error "with_lock: command required"; return 2; }
-  local -a CMD=( "$@" )
+  [[ $# -gt 0 ]] || { boot::__log error "with_lock: command required"; return 2; }
 
-  if command -v flock >/dev/null 2>&1; then
-    local __fd rc
-    mkdir -p -- "$(dirname -- "$lock")" || { boot::log error "with_lock: cannot create dir"; return 1; }
+  # Ensure parent directory exists
+  local parent; parent="$(dirname -- "$lock")"
+  mkdir -p -- "$parent" || { boot::__log error "with_lock: cannot create dir $parent"; return 1; }
+
+  if boot::__has flock; then
+    # Flock path strategy: open FD on a real file, then flock -x -w TIMEOUT
     : > "$lock" 2>/dev/null || true
-    exec {__fd}>"$lock" || { boot::log error "with_lock: open failed"; return 1; }
-    flock -x -w "$timeout" "$__fd" || { eval "exec $__fd>&-"; boot::log error "with_lock: timeout"; return 124; }
-    "${CMD[@]}"; rc=$?
+    local __fd rc
+    exec {__fd}>"$lock" || { boot::__log error "with_lock: open failed: $lock"; return 1; }
+    if ! flock -x -w "${timeout%.*}" "$__fd"; then
+      eval "exec $__fd>&-"
+      boot::__log error "with_lock: timeout"
+      return 124
+    fi
+    "$@"; rc=$?
     { flock -u "$__fd"; eval "exec $__fd>&-"; } 2>/dev/null || true
     return "$rc"
   fi
 
+  # Fallback: mkdir lockdir loop with timeout
   local lockdir="${lock}.dlock" rc=0 acquired=0 t0 now limit
-  t0=$(date +%s); limit="${timeout%.*}"
-  mkdir -p -- "$(dirname -- "$lockdir")" || { boot::log error "with_lock: cannot create parent"; return 1; }
+  t0=$(date +%s)
+  limit="${timeout%.*}"
   trap '((acquired)) && rmdir -- "'"$lockdir"'" 2>/dev/null || true' INT TERM EXIT
   while ! mkdir -- "$lockdir" 2>/dev/null; do
     now=$(date +%s)
-    if (( limit>0 && now - t0 >= limit )); then trap - INT TERM EXIT; boot::log error "with_lock: timeout (fallback)"; return 124; fi
-    sleep 0.1
+    if (( limit>0 && now - t0 >= limit )); then
+      trap - INT TERM EXIT
+      boot::__log error "with_lock: timeout (fallback)"
+      return 124
+    fi
+    # light contention backoff with tiny jitter (0~50ms)
+    if [[ -n "${RANDOM:-}" ]]; then
+      sleep "$(awk -v r="$RANDOM" 'BEGIN{printf "0.%03d\n", int((r/32767)*50)}')"
+    else
+      sleep 0.05
+    fi
   done
   acquired=1
-  "${CMD[@]}"; rc=$?
+  "$@"; rc=$?
   rmdir -- "$lockdir" 2>/dev/null || true
   trap - INT TERM EXIT
   return "$rc"
